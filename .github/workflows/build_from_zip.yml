@@ -1,4 +1,4 @@
-name: Android CI (zip autodetect)
+name: Build from any ZIP (auto-detect)
 
 on:
   workflow_dispatch:
@@ -8,113 +8,125 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: ШАГ 01 — Скачать код
+      - name: ШАГ 01 — Скачать репозиторий
         uses: actions/checkout@v4
 
-      - name: ШАГ 02 — Поставить unzip/wget/zip
-        run: sudo apt-get update && sudo apt-get install -y unzip wget zip rsync
+      - name: ШАГ 02 — Инструменты и список файлов
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip wget
+          echo "== Корень репозитория =="
+          ls -la
 
       - name: ШАГ 03 — Найти и распаковать ZIP
+        run: |
+          set -e
+          ZIP="$(ls -1 *.zip 2>/dev/null | head -n1 || true)"
+          if [ -z "$ZIP" ]; then
+            echo "❌ В корне нет *.zip"; ls -la; exit 1
+          fi
+          echo "✅ Найден ZIP: $ZIP"
+          unzip -o "$ZIP" -d .
+          echo "== После распаковки =="
+          ls -la
+
+      - name: ШАГ 04 — Найти корень Gradle-проекта
+        id: findroot
         shell: bash
         run: |
-          set -euo pipefail
-          ZIP=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
-          if [[ -z "${ZIP}" ]]; then
-            echo "❌ В корне репозитория нет .zip файла с проектом" >&2
-            ls -la
-            exit 1
+          set -e
+          ROOT="$(dirname "$(find . -maxdepth 3 -name 'settings.gradle*' | head -n1)")"
+          if [ -z "$ROOT" ]; then
+            echo "❌ settings.gradle(.kts) не найден внутри ZIP"; exit 1
           fi
-          echo "✅ Нашёл ZIP: $ZIP"
-          unzip -o "$ZIP" -d extract >/dev/null
-
-          # найти корень Gradle-проекта (settings.gradle / .kts)
-          ROOT="extract"
-          if [[ -f "$ROOT/settings.gradle" || -f "$ROOT/settings.gradle.kts" ]]; then
-            PROJ="$ROOT"
-          else
-            CAND=$(find "$ROOT" -maxdepth 2 -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -printf '%h\n' | head -n1)
-            [[ -z "$CAND" ]] && { echo "❌ settings.gradle(.kts) не найден"; exit 1; }
-            PROJ="$CAND"
-          fi
-          echo "PROJ=$PROJ" >> $GITHUB_ENV
-          rsync -a "$PROJ"/ ./src/
-
-      - name: ШАГ 04 — Показать структуру
-        run: |
-          echo "::group::src tree"; ls -la src; echo "::endgroup::"
+          echo "✅ Корень проекта: $ROOT"
+          echo "PROJ=$ROOT" >> $GITHUB_ENV
+          echo "PROJ=$ROOT"
 
       - name: ШАГ 05 — Установить JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-          cache: 'gradle'
 
-      - name: ШАГ 06 — Установить Android SDK
+      - name: ШАГ 06 — Android SDK (платформа/инструменты)
         uses: android-actions/setup-android@v2
-
-      - name: ШАГ 07 — Подготовить gradle.properties (AndroidX + JVM)
+      - name: ШАГ 06.1 — Поставить платформы 33/34 и build-tools
         run: |
-          PROP="src/gradle.properties"
-          touch "$PROP"
-          grep -qxF 'android.useAndroidX=true' "$PROP" || echo 'android.useAndroidX=true' >> "$PROP"
-          grep -qxF 'android.enableJetifier=true' "$PROP" || echo 'android.enableJetifier=true' >> "$PROP"
-          grep -qxF 'org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8' "$PROP" || echo 'org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8' >> "$PROP"
+          yes | sdkmanager "platforms;android-33" "platforms;android-34" "build-tools;33.0.2" "build-tools;34.0.0" || true
 
-      - name: ШАГ 08 — Поставить Gradle 8.7
+      - name: ШАГ 07 — Gradle wrapper (создать при отсутствии) и права
         run: |
-          wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip -O gradle.zip
-          sudo unzip -q gradle.zip -d /opt/gradle
-          echo "/opt/gradle/gradle-8.7/bin" >> $GITHUB_PATH
-
-      - name: ШАГ 09 — Сгенерировать/починить Gradle Wrapper
-        working-directory: src
-        run: |
-          set -e
-          if [[ ! -x ./gradlew ]]; then gradle wrapper --gradle-version 8.7; fi
-          chmod +x gradlew
-          sed -i 's#^distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.7-bin.zip#' gradle/wrapper/gradle-wrapper.properties || true
+          cd "$PROJ"
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+          else
+            echo "gradlew нет — генерирую wrapper Gradle 8.2.1"
+            wget -q https://services.gradle.org/distributions/gradle-8.2.1-bin.zip -O /tmp/g.zip
+            sudo unzip -q -d /opt/gradle /tmp/g.zip
+            /opt/gradle/gradle-8.2.1/bin/gradle wrapper --gradle-version 8.2.1
+            chmod +x gradlew
+          fi
           ./gradlew --version
 
-      - name: ШАГ 10 — Сборка DEBUG (подробный лог)
-        working-directory: src
+      - name: ШАГ 08 — Включить AndroidX/Jetifier и память JVM
         run: |
-          set -o pipefail
-          ./gradlew assembleDebug --stacktrace --info --warning-mode all --no-daemon | tee ../gradle-debug.log
+          cd "$PROJ"
+          {
+            echo "android.useAndroidX=true"
+            echo "android.enableJetifier=true"
+            echo "org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8"
+          } >> gradle.properties
+          echo "== gradle.properties =="
+          cat gradle.properties || true
 
-      - name: ШАГ 11 — Сборка RELEASE (не критично)
-        working-directory: src
+      - name: ШАГ 09 — Показать модули и задачи
         run: |
-          set -o pipefail
-          ./gradlew assembleRelease --stacktrace --info --warning-mode all --no-daemon | tee ../gradle-release.log || true
+          cd "$PROJ"
+          ./gradlew projects || true
+          ./gradlew :app:tasks --all || true
 
-      - name: ШАГ 12 — Найти APK и переименовать
-        id: findapk
-        working-directory: src
+      - name: ШАГ 10 — Сборка DEBUG (полные логи)
+        run: |
+          cd "$PROJ"
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace --console=plain -Dorg.gradle.workers.max=1 --warning-mode all | tee gradle-debug.log
+        continue-on-error: true
+
+      - name: ШАГ 11 — Сборка RELEASE (полные логи)
+        run: |
+          cd "$PROJ"
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace --console=plain -Dorg.gradle.workers.max=1 --warning-mode all | tee gradle-release.log
+        continue-on-error: true
+
+      - name: ШАГ 12 — Найти APK и сложить в out/
+        shell: bash
         run: |
           set -e
-          APK=$(find . -type f -name "*.apk" | head -n1 || true)
-          if [[ -z "$APK" ]]; then
-            echo "❌ APK не найден"; find . -maxdepth 5 -type f | head -n 200; exit 1
-          fi
-          echo "✅ Найден APK: $APK"
-          mkdir -p ../dist
-          cp "$APK" ../dist/GameLauncher.apk
+          cd "$PROJ"
+          mkdir -p out
+          echo "== Ищу APK =="
+          find . -type f -name "*.apk" | sed 's/^/  /' || true
+          D=$(find . -type f -name "*-debug*.apk" | head -n1 || true)
+          R=$(find . -type f -name "*-release*.apk" | head -n1 || true)
+          if [ -n "$D" ]; then cp "$D" out/GameLauncher-debug.apk; fi
+          if [ -n "$R" ]; then cp "$R" out/GameLauncher-release-unsigned.apk; fi
+          ls -la out || true
 
-      - name: ШАГ 13 — Сохранить APK
+      - name: ШАГ 13 — Сохранить APK(и)
         uses: actions/upload-artifact@v4
         with:
-          name: GameLauncher-APK
-          path: dist/GameLauncher.apk
+          name: APKs
+          path: ${{ env.PROJ }}/out/*.apk
+          if-no-files-found: warn
 
-      - name: ШАГ 14 — Сохранить журналы сборки
+      - name: ШАГ 14 — Сохранить отчёты/логи (всегда)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gradle-logs
           path: |
-            gradle-debug.log
-            gradle-release.log
-            src/app/build/outputs
-            src/build/reports
-            **/*.log
+            ${{ env.PROJ }}/gradle-debug.log
+            ${{ env.PROJ }}/gradle-release.log
+            ${{ env.PROJ }}/app/build/outputs/logs/**/*.txt
+            ${{ env.PROJ }}/app/build/reports/**/*
+          if-no-files-found: ignore

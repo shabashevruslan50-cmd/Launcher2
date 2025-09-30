@@ -1,4 +1,4 @@
-name: Build from any ZIP (auto-detect)
+name: Build from ZIP
 
 on:
   workflow_dispatch:
@@ -8,40 +8,24 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: ШАГ 01 — Скачать репозиторий
+      - name: ШАГ 01 — Скачать код
         uses: actions/checkout@v4
 
-      - name: ШАГ 02 — Инструменты и список файлов
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip wget
-          echo "== Корень репозитория =="
-          ls -la
+      - name: ШАГ 02 — Установить unzip
+        run: sudo apt-get update && sudo apt-get install -y unzip
 
-      - name: ШАГ 03 — Найти и распаковать ZIP
-        run: |
-          set -e
-          ZIP="$(ls -1 *.zip 2>/dev/null | head -n1 || true)"
-          if [ -z "$ZIP" ]; then
-            echo "❌ В корне нет *.zip"; ls -la; exit 1
-          fi
-          echo "✅ Найден ZIP: $ZIP"
-          unzip -o "$ZIP" -d .
-          echo "== После распаковки =="
-          ls -la
+      - name: ШАГ 03 — Распаковать ZIP
+        run: unzip -o GameLauncher_fixed.zip -d .
 
-      - name: ШАГ 04 — Найти корень Gradle-проекта
-        id: findroot
-        shell: bash
+      - name: ШАГ 04 — Найти корень проекта и экспортировать переменную PROJ
         run: |
-          set -e
-          ROOT="$(dirname "$(find . -maxdepth 3 -name 'settings.gradle*' | head -n1)")"
-          if [ -z "$ROOT" ]; then
-            echo "❌ settings.gradle(.kts) не найден внутри ZIP"; exit 1
+          if [ -d "app/src/main" ]; then
+            echo "PROJ=." >> $GITHUB_ENV
+          elif [ -d "GameLauncher/app/src/main" ]; then
+            echo "PROJ=GameLauncher" >> $GITHUB_ENV
+          else
+            echo "Не найден проект (нет app/src/main)"; exit 1
           fi
-          echo "✅ Корень проекта: $ROOT"
-          echo "PROJ=$ROOT" >> $GITHUB_ENV
-          echo "PROJ=$ROOT"
 
       - name: ШАГ 05 — Установить JDK 17
         uses: actions/setup-java@v4
@@ -49,84 +33,64 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: ШАГ 06 — Android SDK (платформа/инструменты)
+      - name: ШАГ 05.1 — Установить Gradle 8.7
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: ШАГ 06 — Поставить платформу и инструменты Android 33
         uses: android-actions/setup-android@v2
-      - name: ШАГ 06.1 — Поставить платформы 33/34 и build-tools
-        run: |
-          yes | sdkmanager "platforms;android-33" "platforms;android-34" "build-tools;33.0.2" "build-tools;34.0.0" || true
+        with:
+          packages: |
+            platforms;android-33
+            build-tools;33.0.1
 
-      - name: ШАГ 07 — Gradle wrapper (создать при отсутствии) и права
+      - name: ШАГ 07 — Включить AndroidX и JVM args (на всякий случай)
         run: |
-          cd "$PROJ"
-          if [ -f gradlew ]; then
-            chmod +x gradlew
-          else
-            echo "gradlew нет — генерирую wrapper Gradle 8.2.1"
-            wget -q https://services.gradle.org/distributions/gradle-8.2.1-bin.zip -O /tmp/g.zip
-            sudo unzip -q -d /opt/gradle /tmp/g.zip
-            /opt/gradle/gradle-8.2.1/bin/gradle wrapper --gradle-version 8.2.1
-            chmod +x gradlew
-          fi
-          ./gradlew --version
+          echo "android.useAndroidX=true"       >> "$PROJ/gradle.properties"
+          echo "android.enableJetifier=true"    >> "$PROJ/gradle.properties"
+          echo "org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8" >> "$PROJ/gradle.properties"
+          sed -n '1,200p' "$PROJ/gradle.properties"
 
-      - name: ШАГ 08 — Включить AndroidX/Jetifier и память JVM
+      - name: ШАГ 08 — Сгенерировать Gradle Wrapper 8.7
         run: |
           cd "$PROJ"
-          {
-            echo "android.useAndroidX=true"
-            echo "android.enableJetifier=true"
-            echo "org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8"
-          } >> gradle.properties
-          echo "== gradle.properties =="
-          cat gradle.properties || true
+          gradle wrapper --gradle-version 8.7
+          chmod +x gradlew
 
-      - name: ШАГ 09 — Показать модули и задачи
+      - name: ШАГ 09 — Сборка DEBUG (подробные логи)
         run: |
           cd "$PROJ"
-          ./gradlew projects || true
-          ./gradlew :app:tasks --all || true
+          ./gradlew assembleDebug --stacktrace --warning-mode all
 
-      - name: ШАГ 10 — Сборка DEBUG (полные логи)
+      - name: ШАГ 10 — Сборка RELEASE (подробные логи)
         run: |
           cd "$PROJ"
-          ./gradlew :app:assembleDebug --no-daemon --stacktrace --console=plain -Dorg.gradle.workers.max=1 --warning-mode all | tee gradle-debug.log
-        continue-on-error: true
+          ./gradlew assembleRelease --stacktrace --warning-mode all
 
-      - name: ШАГ 11 — Сборка RELEASE (полные логи)
-        run: |
-          cd "$PROJ"
-          ./gradlew :app:assembleRelease --no-daemon --stacktrace --console=plain -Dorg.gradle.workers.max=1 --warning-mode all | tee gradle-release.log
-        continue-on-error: true
-
-      - name: ШАГ 12 — Найти APK и сложить в out/
-        shell: bash
+      - name: ШАГ 11 — Найти APK и переименовать
+        id: findapk
         run: |
           set -e
           cd "$PROJ"
-          mkdir -p out
-          echo "== Ищу APK =="
-          find . -type f -name "*.apk" | sed 's/^/  /' || true
-          D=$(find . -type f -name "*-debug*.apk" | head -n1 || true)
-          R=$(find . -type f -name "*-release*.apk" | head -n1 || true)
-          if [ -n "$D" ]; then cp "$D" out/GameLauncher-debug.apk; fi
-          if [ -n "$R" ]; then cp "$R" out/GameLauncher-release-unsigned.apk; fi
-          ls -la out || true
+          APK="$(ls -1 app/build/outputs/apk/debug/*.apk 2>/dev/null || true)"
+          [ -z "$APK" ] && APK="$(ls -1 app/build/outputs/apk/release/*.apk 2>/dev/null || true)"
+          if [ -z "$APK" ]; then
+            echo "APK не найден"; exit 1
+          fi
+          cp "$APK" GameLauncher.apk
+          echo "apk_path=$PWD/GameLauncher.apk" >> $GITHUB_OUTPUT
 
-      - name: ШАГ 13 — Сохранить APK(и)
+      - name: ШАГ 12 — Сохранить APK
         uses: actions/upload-artifact@v4
         with:
-          name: APKs
-          path: ${{ env.PROJ }}/out/*.apk
-          if-no-files-found: warn
+          name: GameLauncher-APK
+          path: ${{ steps.findapk.outputs.apk_path }}
 
-      - name: ШАГ 14 — Сохранить отчёты/логи (всегда)
-        if: always()
+      - name: ШАГ 13 — Сохранить журналы сборки (если упадёт)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: gradle-logs
           path: |
-            ${{ env.PROJ }}/gradle-debug.log
-            ${{ env.PROJ }}/gradle-release.log
-            ${{ env.PROJ }}/app/build/outputs/logs/**/*.txt
-            ${{ env.PROJ }}/app/build/reports/**/*
-          if-no-files-found: ignore
+            **/build/**/reports/**
+            **/build/**/outputs/**
+            **/build/**/logs/**
